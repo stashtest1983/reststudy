@@ -1,0 +1,226 @@
+#!/usr/bin/env groovy
+
+
+
+pipeline {
+triggers {
+pollSCM('*/15 * * * *')
+}
+agent {
+kubernetes {
+defaultContainer 'docker'
+yaml """
+spec:
+containers:
+- name: 'git'
+image: 'alpine/git'
+tty: true
+command:
+- cat
+- name: 'gradle'
+image: 'gradle:6.3.0-jdk8'
+command:
+- cat
+tty: true
+- name: 'maven'
+image: 'maven:3.3.9-jdk-8-alpine'
+command:
+- cat
+tty: true
+- name: 'docker'
+image: 'docker:18-git'
+command:
+- cat
+tty: true
+volumeMounts:
+- mountPath: /var/run/docker.sock
+name: test-volume
+- mountPath: /home/gradle/.gradle
+name: gradle-file
+volumes:
+- name: test-volume
+hostPath:
+path: /var/run/docker.sock
+- name: gradle-file
+hostPath:
+path: /tmp/jenkins/.gradle
+"""
+}
+}
+
+environment {
+registry = "docker.repo.eng.netapp.com/cicd/aiqum/"
+}
+
+options { disableConcurrentBuilds() }
+
+
+
+stages {
+stage('Permissions') {
+steps {
+container('gradle') {
+sh 'chmod 775 *'
+script {
+print "Hi"
+print "BUILD ID: ${env.BUILD_ID}"
+}
+echo "Running ${env.BUILD_ID} on ${env.JENKINS_URL}"
+sh "printenv | grep ${env.BUILD_ID}"
+
+}
+}
+}
+
+stage('Cleanup') {
+steps {
+container('gradle') {
+//sh './gradlew --no-daemon clean'
+sh '''#!/bin/bash
+echo "I am bash"
+./gradlew --no-daemon clean
+'''
+}
+}
+}
+
+
+
+stage('Check Style, FindBugs, PMD') {
+steps {
+container('gradle') {
+sh './gradlew --no-daemon checkstyleMain checkstyleTest findbugsMain findbugsTest pmdMain pmdTest cpdCheck'
+}
+}
+post {
+always {
+step([
+$class : 'FindBugsPublisher',
+pattern : 'build/reports/findbugs/*.xml',
+canRunOnFailed : true
+])
+}
+}
+}
+
+
+
+stage('Build') {
+steps {
+container('gradle') {
+sh './gradlew --no-daemon build'
+sh 'pwd'
+sh 'ls'
+}
+}
+}
+
+stage('Test') {
+steps {
+container('gradle') {
+sh './gradlew --no-daemon check'
+}
+
+}
+post {
+always {
+junit 'build/test-results/test/*.xml'
+}
+}
+}
+
+
+
+
+
+stage('Check container environment') {
+steps {
+container('docker') {
+// example to show you can run docker commands when you mount the socket
+sh 'hostname'
+sh 'hostname -i'
+sh 'docker ps'
+sh 'pwd'
+sh 'ls'
+}
+}
+}
+
+stage('Build Docker image') {
+steps {
+container('docker') {
+sh 'pwd'
+sh 'ls'
+sh '''
+docker build --no-cache -t spring-boot-rest-api-service .
+'''
+}
+}
+}
+
+
+
+stage('Push Docker image') {
+environment {
+registryCredential = 'dockerhub'
+}
+when { branch "master" }
+steps {
+container('docker') {
+echo "Push docker image1"
+
+withDockerRegistry([credentialsId: 'dockerhub', url: "https://docker.repo.eng.netapp.com/"]) {
+sh "docker build -t spring-boot-rest-api-service:${env.BUILD_ID} ."
+sh "docker images"
+sh "docker tag spring-boot-rest-api-service:${env.BUILD_ID} docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:${env.BUILD_ID}"
+sh "docker push docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:${env.BUILD_ID}"
+sh "docker tag spring-boot-rest-api-service:${env.BUILD_ID} docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:latest"
+sh "docker push docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:latest"
+}
+}
+}
+}
+
+
+
+stage('Deploy container') {
+environment {
+registryCredential = 'dockerhub'
+}
+when { branch "master" }
+steps {
+container('docker') {
+echo "Deploy Container"
+withDockerRegistry([credentialsId: 'dockerhub', url: "https://docker.repo.eng.netapp.com/"]) {
+sh "docker pull docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:latest"
+sh "docker stop SpringBootRestApiService"
+sh "docker rm SpringBootRestApiService"
+sh "docker run -p 9090:9090 --name spring-boot-rest-api-service -t -d docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service"
+sh "docker ps"
+}
+}
+}
+}
+
+
+
+stage('Release Docker image') {
+environment {
+registryCredential = 'dockerhub'
+TAG_NAME = "R1.0"
+}
+when { branch "master" }
+steps {
+container('docker') {
+echo "Releasing Docker Image with NetApp product version Tag"
+withDockerRegistry([credentialsId: 'dockerhub', url: "https://docker.repo.eng.netapp.com/"]) {
+sh "docker build --no-cache -t spring-boot-rest-api-service ."
+sh "docker tag spring-boot-rest-api-service:latest docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:${env.TAG_NAME}"
+sh "docker push docker.repo.eng.netapp.com/cicd/aiqum/spring-boot-rest-api-service:${env.TAG_NAME}"
+sh "docker rmi spring-boot-rest-api-service"
+}
+}
+}
+}
+}
+}
